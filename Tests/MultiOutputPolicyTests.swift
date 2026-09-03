@@ -1,10 +1,37 @@
 import CoreAudio
 import Testing
 
-private func device(_ uid: String, bluetooth: Bool = false) -> AudioDevice {
-    AudioDevice(id: AudioDeviceID(0), uid: uid, name: uid,
+private func device(_ uid: String, id: AudioDeviceID = 0, bluetooth: Bool = false) -> AudioDevice {
+    AudioDevice(id: id, uid: uid, name: uid,
                 transport: bluetooth ? kAudioDeviceTransportTypeBluetooth : kAudioDeviceTransportTypeBuiltIn,
                 outputDataSource: 0, inputDataSource: 0)
+}
+
+@Suite("MultiOutputPolicy.refreshed")
+struct MultiOutputRefreshTests {
+    @Test("preserves membership order while replacing republished object IDs")
+    func replacesObjectIDs() {
+        let old = [device("speaker", id: 10), device("buds", id: 11)]
+        let present = [device("buds", id: 21), device("speaker", id: 20)]
+
+        let refreshed = MultiOutputPolicy.refreshed(members: old, present: present)
+
+        #expect(refreshed.map(\.uid) == ["speaker", "buds"])
+        #expect(refreshed.map(\.id) == [20, 21])
+    }
+
+    @Test("drops members no longer present")
+    func dropsMissing() {
+        let old = [device("speaker", id: 10), device("buds", id: 11)]
+
+        let refreshed = MultiOutputPolicy.refreshed(
+            members: old,
+            present: [device("speaker", id: 20), device("display", id: 30)]
+        )
+
+        #expect(refreshed.map(\.uid) == ["speaker"])
+        #expect(refreshed.map(\.id) == [20])
+    }
 }
 
 @Suite("MultiOutputPolicy.clock")

@@ -70,11 +70,34 @@ final class MultiOutputController {
     /// Members whose HAL device vanished (Bluetooth dropped) leave; a single
     /// survivor means multi-output is over and it becomes the plain default.
     func handleDevicesChanged(present: [AudioDevice]) {
-        guard isActive else { return }
-        let presentUIDs = Set(present.map(\.uid))
-        let alive = members.map(\.device).filter { presentUIDs.contains($0.uid) }
-        guard alive.count < members.count else { return }
-        resolve(MultiOutputPolicy.resolution(survivors: alive))
+        // A failed destroy leaves the ID tracked with no active members. Retry
+        // opportunistically instead of forgetting a public aggregate forever.
+        guard isActive else {
+            if aggregateID.isValid {
+                _ = prepareToDestroyAggregate(preferredFallback: present.first)
+            }
+            return
+        }
+
+        let oldDevices = members.map(\.device)
+        let refreshed = MultiOutputPolicy.refreshed(members: oldDevices, present: present)
+        guard refreshed.count == oldDevices.count else {
+            let resolution = MultiOutputPolicy.resolution(survivors: refreshed)
+            if case .dissolve(to: nil) = resolution {
+                dissolve(to: present.first)
+            } else {
+                resolve(resolution)
+            }
+            return
+        }
+
+        // A device may disappear and re-publish under the same UID but a new
+        // object ID (common across wake/reconnect). Recreate the aggregate and
+        // its volume controllers rather than keeping dead HAL references.
+        let idsChanged = zip(oldDevices, refreshed).contains { $0.id != $1.id }
+        if idsChanged || !aggregateIsAlive {
+            apply(refreshed)
+        }
     }
 
     private func resolve(_ resolution: MultiOutputPolicy.Resolution) {
@@ -87,7 +110,7 @@ final class MultiOutputController {
     /// Quit teardown: route back to a real device and remove the aggregate —
     /// a leftover public aggregate would haunt Sound settings.
     func shutdown() {
-        guard isActive else { return }
+        guard aggregateID.isValid else { return }
         dissolve(to: members.first?.device)
     }
 
@@ -95,16 +118,13 @@ final class MultiOutputController {
 
     private func apply(_ devices: [AudioDevice]) {
         guard let clock = MultiOutputPolicy.clock(among: devices) else { return }
+        let previousMembers = members
 
         // Membership changes recreate the aggregate (mutating the sub-device
         // list in place loses the drift settings). Route to the clock device
         // first so destroying the current default can't strand the system on
         // an arbitrary fallback.
-        if aggregateID.isValid {
-            try? AudioObjectID.system.write(kAudioHardwarePropertyDefaultOutputDevice, value: clock.id)
-            AudioHardwareDestroyAggregateDevice(aggregateID)
-            aggregateID = .unknown
-        }
+        guard prepareToDestroyAggregate(preferredFallback: clock) else { return }
 
         let description: [String: Any] = [
             kAudioAggregateDeviceNameKey: Self.aggregateName,
@@ -123,49 +143,49 @@ final class MultiOutputController {
             members = []
             return
         }
+        aggregateID = aggregate
 
         do {
             try AudioObjectID.system.write(kAudioHardwarePropertyDefaultOutputDevice, value: aggregate)
         } catch {
             Self.logger.error("Failed to route to multi-output aggregate: \(error.localizedDescription)")
-            AudioHardwareDestroyAggregateDevice(aggregate)
             members = []
+            _ = destroyTrackedAggregate()
+            // If destruction failed, aggregateID intentionally remains valid so
+            // later device events, pair attempts, or shutdown can retry it.
             return
         }
-        aggregateID = aggregate
         members = devices.map { device in
-            Member(device: device, volume: volumeController(for: device))
+            Member(device: device, volume: volumeController(for: device, reusing: previousMembers))
         }
         Self.logger.info("Multi-output active: \(devices.map(\.name).joined(separator: " + "), privacy: .public)")
     }
 
     /// Reuses a surviving member's controller so its HAL listeners and
     /// published state carry over membership changes.
-    private func volumeController(for device: AudioDevice) -> DeviceVolumeController {
-        members.first { $0.device.uid == device.uid }?.volume ?? DeviceVolumeController(deviceID: device.id)
+    private func volumeController(for device: AudioDevice, reusing previous: [Member]) -> DeviceVolumeController {
+        previous.first { $0.device.uid == device.uid && $0.device.id == device.id }?.volume
+            ?? DeviceVolumeController(deviceID: device.id)
     }
 
     private func dissolve(to device: AudioDevice?) {
-        if let device {
-            try? AudioObjectID.system.write(kAudioHardwarePropertyDefaultOutputDevice, value: device.id)
-        }
-        if aggregateID.isValid {
-            AudioHardwareDestroyAggregateDevice(aggregateID)
-            aggregateID = .unknown
-        }
-        members = []
+        _ = prepareToDestroyAggregate(preferredFallback: device)
     }
 
     /// `apply` runs synchronously on the main actor, so by the time this
     /// queued listener task observes the default it already points at the
     /// (re)created aggregate — only genuinely external switches dissolve.
     private func dissolveIfRoutedAway() {
-        guard isActive,
+        guard aggregateID.isValid,
               let current = try? AudioObjectID.readDefaultOutputDevice(),
               current != aggregateID
         else { return }
-        Self.logger.info("Default output moved elsewhere; dissolving multi-output")
-        dissolve(to: nil)
+        if isActive {
+            Self.logger.info("Default output moved elsewhere; dissolving multi-output")
+        }
+        // The system already routes elsewhere, so no fallback write is needed.
+        members = []
+        _ = destroyTrackedAggregate()
     }
 
     /// A crash or kill can leave the public aggregate behind. If a previous
@@ -176,14 +196,90 @@ final class MultiOutputController {
               let leftover = ids.first(where: { (try? $0.readDeviceUID()) == Self.aggregateUID })
         else { return }
 
+        aggregateID = leftover
         let isDefault = (try? AudioObjectID.readDefaultOutputDevice()) == leftover
-        guard isDefault, let devices = subDevices(of: leftover), devices.count > 1 else {
-            AudioHardwareDestroyAggregateDevice(leftover)
+        let devices = subDevices(of: leftover)
+        guard isDefault, let devices, devices.count > 1 else {
+            _ = prepareToDestroyAggregate(preferredFallback: devices?.first)
             return
         }
-        aggregateID = leftover
         members = devices.map { Member(device: $0, volume: DeviceVolumeController(deviceID: $0.id)) }
         Self.logger.info("Adopted multi-output aggregate from a previous run")
+    }
+
+    /// True only while the tracked aggregate still answers HAL's liveness
+    /// property. UID presence alone cannot catch a dead aggregate after wake.
+    private var aggregateIsAlive: Bool {
+        guard aggregateID.isValid else { return false }
+        var alive: UInt32 = 0
+        guard (try? aggregateID.read(kAudioDevicePropertyDeviceIsAlive, into: &alive)) != nil else { return false }
+        return alive != 0
+    }
+
+    /// Routes away before deleting a tracked public aggregate. If any safety
+    /// step fails, the ID remains tracked for a later retry; the controller
+    /// never claims cleanup succeeded when HAL said otherwise.
+    @discardableResult
+    private func prepareToDestroyAggregate(preferredFallback: AudioDevice?) -> Bool {
+        guard aggregateID.isValid else {
+            members = []
+            return true
+        }
+
+        guard let current = try? AudioObjectID.readDefaultOutputDevice() else {
+            Self.logger.error("Cannot safely destroy multi-output: failed to read the default output")
+            return false
+        }
+        if current == aggregateID {
+            guard let fallback = validFallback(preferredFallback) ?? firstAvailableOutput() else {
+                Self.logger.error("Cannot safely destroy multi-output: no fallback output is available")
+                return false
+            }
+            do {
+                try AudioObjectID.system.write(kAudioHardwarePropertyDefaultOutputDevice, value: fallback.id)
+            } catch {
+                Self.logger
+                    .error("Cannot safely destroy multi-output: fallback routing failed: \(error.localizedDescription)")
+                return false
+            }
+        }
+
+        members = []
+        return destroyTrackedAggregate()
+    }
+
+    private func validFallback(_ device: AudioDevice?) -> AudioDevice? {
+        guard let device,
+              device.id != aggregateID,
+              device.id.channelCount(scope: kAudioDevicePropertyScopeOutput) > 0,
+              let current = AudioDevice(id: device.id), !current.isFaderPlumbing
+        else { return nil }
+        return current
+    }
+
+    private func firstAvailableOutput() -> AudioDevice? {
+        guard let ids = try? AudioObjectID.system.readArray(kAudioHardwarePropertyDevices, of: AudioDeviceID.self)
+        else { return nil }
+        return ids.lazy.compactMap { id -> AudioDevice? in
+            guard id != self.aggregateID,
+                  id.channelCount(scope: kAudioDevicePropertyScopeOutput) > 0,
+                  let device = AudioDevice(id: id), !device.isFaderPlumbing
+            else { return nil }
+            return device
+        }.first
+    }
+
+    @discardableResult
+    private func destroyTrackedAggregate() -> Bool {
+        guard aggregateID.isValid else { return true }
+        let doomed = aggregateID
+        let status = AudioHardwareDestroyAggregateDevice(doomed)
+        guard status == noErr else {
+            Self.logger.error("Failed to destroy multi-output aggregate \(doomed): OSStatus \(status)")
+            return false
+        }
+        aggregateID = .unknown
+        return true
     }
 
     private func subDevices(of aggregate: AudioObjectID) -> [AudioDevice]? {
