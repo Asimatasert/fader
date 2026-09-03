@@ -10,8 +10,8 @@ SWIFTLINT_SHA256=d6cb0aa7a2f5f1ef306fc9e37bcb54dc9a26facc8f7784ac0c3dd3eccf5c6ba
 SWIFTFORMAT_VERSION=0.62.1
 SWIFTFORMAT_SHA256=7cb1cb1fae04932047c7015441c543848e8e60e1572d808d080e0a1f1661114a
 # Keep in sync with the SPM pin in project.yml.
-SPARKLE_VERSION=2.9.5
-SPARKLE_SHA256=015336b601493e05c237964954bff6191370003d94edefe663724c88840d73cc
+SPARKLE_VERSION=2.9.6
+SPARKLE_SHA256=52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192
 
 # A project.yml-only Sparkle bump would ship a framework newer than the
 # sign_update CLI with no error anywhere — refuse to drift.
